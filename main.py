@@ -163,18 +163,83 @@ def process_section(target_info):
                     with open(sub_path, 'r', encoding='utf-8') as sf:
                         all_q_files.update(get_questions_from_html(BeautifulSoup(sf.read(), 'html.parser')))
 
-    # --- 核心改进：内容指纹去重 ---
-    unique_questions = {}
+    def _normalize_question_text(html_fragment: str) -> str:
+        """用于去重的题干文本规范化：
+        - 去掉 HTML 标签
+        - 统一 nbsp/全角空白
+        - 把多余的换行/空格折叠为单个空格
+        """
+        text = re.sub(r'<[^>]+>', ' ', html_fragment)
+        text = text.replace('\u00a0', ' ').replace('\u3000', ' ')
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
+    def _pick_better_question(existing: dict, candidate: dict) -> dict:
+        """同一题号/同一题干出现多份时，尽量选择信息更完整的一份。"""
+        if not existing:
+            return candidate
+
+        # 优先保留有评分标准的版本
+        existing_has_ms = existing.get('ms') and existing.get('ms') != 'No Markscheme'
+        candidate_has_ms = candidate.get('ms') and candidate.get('ms') != 'No Markscheme'
+        if candidate_has_ms and not existing_has_ms:
+            return candidate
+        if existing_has_ms and not candidate_has_ms:
+            return existing
+
+        # 优先保留能提取到 marks 的版本
+        existing_has_marks = bool(existing.get('marks'))
+        candidate_has_marks = bool(candidate.get('marks'))
+        if candidate_has_marks and not existing_has_marks:
+            return candidate
+        if existing_has_marks and not candidate_has_marks:
+            return existing
+
+        # 题干更长通常信息更完整（少被截断/少缺图）
+        existing_len = len(_normalize_question_text(existing.get('body', '')))
+        candidate_len = len(_normalize_question_text(candidate.get('body', '')))
+        if candidate_len > existing_len:
+            return candidate
+
+        return existing
+
+    # --- 核心改进：对比题号 + 空白规范化后内容指纹去重 ---
+    # 第一层：按题号(q_id)去重，避免同一题被重复抓取
+    by_qid = {}
+    # 第二层：按“规范化题干”的指纹去重，处理题干只差空格/回车的重复
+    by_fingerprint = {}
+
     for q_file in sorted(list(all_q_files)):
         data = parse_single_question(q_file)
-        if not data: continue
-        
-        # 提取题干纯文本生成哈希值，忽略 HTML 标签和多余空格
-        pure_content = re.sub(r'<[^>]+>', '', data['body']).strip()
-        content_hash = hashlib.md5(pure_content.encode('utf-8')).hexdigest()
-        
-        # 如果内容相同，仅保留 ID 较短或较全的一个（这里简单覆盖，保留最后遇到的一个）
-        if content_hash not in unique_questions:
+        if not data:
+            continue
+
+        qid = (data.get('id') or '').strip()
+        normalized = _normalize_question_text(data.get('body', ''))
+        content_hash = hashlib.md5(normalized.encode('utf-8')).hexdigest()
+
+        # 1) 优先按题号去重（题号正常时更可靠）
+        if qid and qid != 'Unknown ID':
+            if qid in by_qid:
+                by_qid[qid] = _pick_better_question(by_qid[qid], data)
+            else:
+                by_qid[qid] = data
+            continue
+
+        # 2) 题号缺失/异常时，退化到内容指纹去重
+        if content_hash in by_fingerprint:
+            by_fingerprint[content_hash] = _pick_better_question(by_fingerprint[content_hash], data)
+        else:
+            by_fingerprint[content_hash] = data
+
+    # 把两种来源合并，再做一次“内容指纹”层面的最终去重
+    unique_questions = {}
+    for data in list(by_qid.values()) + list(by_fingerprint.values()):
+        normalized = _normalize_question_text(data.get('body', ''))
+        content_hash = hashlib.md5(normalized.encode('utf-8')).hexdigest()
+        if content_hash in unique_questions:
+            unique_questions[content_hash] = _pick_better_question(unique_questions[content_hash], data)
+        else:
             unique_questions[content_hash] = data
 
     # 初始化分类字典
