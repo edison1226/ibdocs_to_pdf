@@ -71,7 +71,7 @@ def clean_title(text):
 def parse_single_question(q_filename):
     """
     解析单个题目文件。
-    读取HTML文件，提取题目ID、试卷类型、题目内容和评分标准。
+    读取HTML文件，提取题目ID、试卷类型、题目内容、分值（如有）和评分标准。
     """
     file_path = os.path.join(QUESTIONS_DIR, q_filename)
     if not os.path.exists(file_path): return None
@@ -95,6 +95,18 @@ def parse_single_question(q_filename):
         # 根据题目ID修正 Paper 类型（如果ID包含1A或1B但被识别为Paper 2）
         if paper_type == "Paper 2" and "1A" in q_id: paper_type = "Paper 1A"
         if paper_type == "Paper 2" and "1B" in q_id: paper_type = "Paper 1B"
+
+        # 提取分值 (Marks)
+        # 逻辑：在 HTML 文本中寻找类似 [2]、[2 marks] 之类的标记
+        # 说明：Paper 1A 通常为客观题/填空，默认不显示 marks（可按需要改）
+        q_marks = ""
+        if paper_type != "Paper 1A":
+            full_text = soup.get_text(" ", strip=True)
+            mark_match = re.search(r'\[(\d+)\s*marks?\]', full_text, re.I)
+            if not mark_match:
+                mark_match = re.search(r'\[(\d+)\]', full_text)
+            if mark_match:
+                q_marks = f"[{mark_match.group(1)} marks]"
         
         # 提取题目主体内容
         q_body = soup.select_one('.qc_body')
@@ -110,7 +122,7 @@ def parse_single_question(q_filename):
                 abs_img_path = os.path.abspath(os.path.join(QUESTIONS_DIR, img['src']))
                 img['src'] = 'file:///' + abs_img_path.replace('\\', '/')
 
-        return {"id": q_id, "body": str(q_body), "ms": q_ms, "paper": paper_type}
+        return {"id": q_id, "body": str(q_body), "ms": q_ms, "paper": paper_type, "marks": q_marks}
     except: return None
 
 def get_questions_from_html(soup):
@@ -190,18 +202,22 @@ def process_section(target_info):
             answers_html += f"<div style='background:#f4f4f4; padding:5px; margin: 15px 0;'><b>{cat} Answers</b></div>"
             
             for q in categories[cat]:
-                # 题目部分：显示 Question 序号 和 Reference Code
+                # 题目部分：显示 Question 序号、分值（如有）和 Reference Code
                 questions_html += f"""
                 <div class="question-wrapper">
-                    <div class="q-meta">Question {global_count} <span style="float:right;">Ref: {q['id']}</span></div>
+                    <div class="q-meta">
+                        Question {global_count}
+                        <span class="q-marks">{q.get('marks','')}</span>
+                        <span style="float:right; font-weight: normal; font-size: 9pt; color: #777;">Ref: {q['id']}</span>
+                    </div>
                     <div class="q-content">{q['body']}</div>
                     <div class="answer-lines">{"<div class='line'></div>" * (1 if cat == 'Paper 1A' else 4)}</div>
                 </div>"""
                 
-                # 答案部分：显示对应序号和评分标准
+                # 答案部分：显示对应序号、题目ID、分值（如有）和评分标准
                 answers_html += f"""
                 <div class="ans-block">
-                    <div class="ans-num">Question {global_count} ({q['id']})</div>
+                    <div class="ans-num">Question {global_count} ({q['id']}) <span style=\"color:#777; font-size:0.9em;\">{q.get('marks','')}</span></div>
                     <div class="ans-ms">{q['ms']}</div>
                 </div>"""
                 
@@ -219,7 +235,8 @@ def process_section(target_info):
             h1 {{ text-align: center; margin-bottom: 30px; }}
             .paper-header {{ background: #000; color: #fff; padding: 8px 15px; font-weight: bold; margin: 30px 0 15px 0; }}
             .question-wrapper {{ page-break-inside: avoid; margin-bottom: 40px; border-bottom: 1px solid #eee; padding-bottom: 10px; }}
-            .q-meta {{ font-weight: bold; font-size: 13pt; border-bottom: 2px solid #333; margin-bottom: 10px; }}
+            .q-meta {{ font-weight: bold; font-size: 13pt; border-bottom: 2px solid #333; margin-bottom: 10px; position: relative; }}
+            .q-marks {{ color: #2c3e50; margin-left: 15px; font-size: 11pt; }}
             .q-content {{ margin-bottom: 15px; }}
             .line {{ border-bottom: 1px solid #999; height: 32px; margin-bottom: 2px; }}
             
