@@ -11,7 +11,6 @@
 import os
 import re
 import glob
-import time
 import hashlib
 import shutil
 from bs4 import BeautifulSoup
@@ -19,8 +18,8 @@ import pdfkit
 from multiprocessing import Pool, cpu_count
 
 # ================= 配置区域 =================
-# 获取当前工作目录
-BASE_DIR = os.getcwd()
+# 获取脚本所在目录（比 os.getcwd() 更稳：避免从别的目录运行时找不到输入/输出）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 定义教学大纲章节目录
 SYLLABUS_DIR = os.path.join(BASE_DIR, "syllabus_sections")
 # 定义题目节点树目录
@@ -110,17 +109,23 @@ def parse_single_question(q_filename):
         
         # 提取题目主体内容
         q_body = soup.select_one('.qc_body')
-        if not q_body: return None
-        
+        if not q_body:
+            return None
+
         # 提取评分标准 (Markscheme)
         ms_tag = soup.select_one('.qc_markscheme .card-body')
-        q_ms = str(ms_tag) if ms_tag else "No Markscheme"
 
         # 处理图片路径，将其转换为绝对路径以便 pdfkit 正确加载
-        for img in q_body.find_all('img'):
-            if img.get('src') and not img['src'].startswith(('http', 'data:')):
-                abs_img_path = os.path.abspath(os.path.join(QUESTIONS_DIR, img['src']))
-                img['src'] = 'file:///' + abs_img_path.replace('\\', '/')
+        # 题干 + 评分标准里都有可能出现图片
+        for container in [q_body, ms_tag]:
+            if not container:
+                continue
+            for img in container.find_all('img'):
+                if img.get('src') and not img['src'].startswith(('http', 'data:')):
+                    abs_img_path = os.path.abspath(os.path.join(QUESTIONS_DIR, img['src']))
+                    img['src'] = 'file:///' + abs_img_path.replace('\\', '/')
+
+        q_ms = str(ms_tag) if ms_tag else "No Markscheme"
 
         return {"id": q_id, "body": str(q_body), "ms": q_ms, "paper": paper_type, "marks": q_marks}
     except: return None
@@ -144,8 +149,15 @@ def process_section(target_info):
     
     # 从标题中提取前缀和编号，用于生成输出文件名
     match = re.search(r'(S|R)[a-z]+\s+(\d+)\.(\d+)', title, re.I)
-    prefix = match.group(1).lower()
-    out_name = f"{prefix}{match.group(2)}_{match.group(3)}.pdf"
+    if match:
+        prefix = match.group(1).lower()
+        base_out = f"{prefix}{match.group(2)}_{match.group(3)}"
+    else:
+        safe = re.sub(r'[^a-zA-Z0-9._-]+', '_', title).strip('_')
+        base_out = safe or "section"
+
+    out_main_name = f"{base_out}.pdf"
+    out_sheet_name = f"{base_out}_answers.pdf"
     
     with open(file_path, 'r', encoding='utf-8') as f:
         soup = BeautifulSoup(f.read(), 'html.parser')
@@ -250,84 +262,151 @@ def process_section(target_info):
         cat_key = data['paper'] if data['paper'] in categories else "Paper 2"
         categories[cat_key].append(data)
 
-    # 准备 HTML 内容
-    questions_html = ""
-    # 答案部分单独分页，并添加标题
-    answers_html = "<div style='page-break-before: always; text-align: center; border-bottom: 2px solid #000;'><h1>Answer Key</h1></div>"
-    
+    # --- 渲染逻辑：生成两个 PDF ---
+    # 1) 主 PDF：题目 + Detailed Markscheme（单独分页）
+    main_questions_html = f"<h1>{title}</h1>"
+    main_answers_html = "<div style='page-break-before: always; text-align: center; border-bottom: 2px solid #000;'><h1>Detailed Markscheme</h1></div>"
+
+    # 2) Answer Sheet：用于快速核对
+    sheet_html = f"<h1 style='color:#2c3e50;'>Answer Sheet: {title}</h1>"
+
     global_count = 1
     has_content = False
 
-    # 按 Paper 顺序生成 HTML
     for cat in ["Paper 1A", "Paper 1B", "Paper 2"]:
-        if categories[cat]:
-            has_content = True
-            # 添加 Paper 标题栏
-            questions_html += f"<div class='paper-header'>{cat}</div>"
-            answers_html += f"<div style='background:#f4f4f4; padding:5px; margin: 15px 0;'><b>{cat} Answers</b></div>"
-            
-            for q in categories[cat]:
-                # 题目部分：显示 Question 序号、分值（如有）和 Reference Code
-                questions_html += f"""
+        if not categories[cat]:
+            continue
+
+        has_content = True
+        main_questions_html += f"<div class='paper-header'>{cat}</div>"
+        main_answers_html += f"<div style='background:#f4f4f4; padding:5px; margin: 15px 0;'><b>{cat}</b></div>"
+        sheet_html += f"<div style='background:#2c3e50; color:white; padding:5px; margin-top:20px;'><b>{cat} Quick Check</b></div>"
+
+        # Paper 1A：Answer Sheet 特殊排版（5 个一组，显示答案字母）
+        if cat == "Paper 1A":
+            sheet_html += "<div style='display:flex; flex-wrap:wrap;'>"
+            for i, q in enumerate(categories[cat]):
+                group_style = "margin-right: 30px;" if (i + 1) % 5 == 0 else "margin-right: 10px;"
+
+                # 提取选择题答案字母：从评分标准文本中抓 A/B/C/D
+                letter = "?"
+                if q.get('ms') and q['ms'] != 'No Markscheme':
+                    ans_soup = BeautifulSoup(q['ms'], 'html.parser')
+                    raw_ans = ans_soup.get_text(" ", strip=True)
+                    letter_match = re.search(r'\b([A-D])\b', raw_ans)
+                    if letter_match:
+                        letter = letter_match.group(1)
+
+                sheet_html += (
+                    f"<div style='width:80px; padding:10px; border-bottom:1px solid #eee; {group_style}'>"
+                    f"<b>{global_count}.</b> <span style='color:#c0392b; font-size:1.2em;'>{letter}</span>"
+                    f"</div>"
+                )
+
+                main_questions_html += f"""
                 <div class="question-wrapper">
-                    <div class="q-meta">
-                        Question {global_count}
-                        <span class="q-marks">{q.get('marks','')}</span>
-                        <span style="float:right; font-weight: normal; font-size: 9pt; color: #777;">Ref: {q['id']}</span>
-                    </div>
+                    <div class="q-meta">Question {global_count}<span style="float:right; font-weight: normal; font-size: 9pt; color: #777;">Ref: {q['id']}</span></div>
                     <div class="q-content">{q['body']}</div>
-                    <div class="answer-lines">{"<div class='line'></div>" * (1 if cat == 'Paper 1A' else 4)}</div>
+                    <div class="answer-lines"><div class='line'></div></div>
                 </div>"""
-                
-                # 答案部分：显示对应序号、题目ID、分值（如有）和评分标准
-                answers_html += f"""
+
+                main_answers_html += f"""
                 <div class="ans-block">
-                    <div class="ans-num">Question {global_count} ({q['id']}) <span style=\"color:#777; font-size:0.9em;\">{q.get('marks','')}</span></div>
+                    <div class="ans-num">Question {global_count} ({q['id']})</div>
                     <div class="ans-ms">{q['ms']}</div>
                 </div>"""
-                
+
                 global_count += 1
+            sheet_html += "</div>"
+            continue
 
-    if not has_content: return f"SKIP: {out_name}"
+        # Paper 1B / Paper 2
+        for q in categories[cat]:
+            sheet_html += (
+                f"<div style='margin:10px 0; border-bottom:1px dashed #ccc; padding-bottom:5px;'>"
+                f"<b>{global_count}.</b> {q.get('marks','')} <span style='color:#777; font-size:0.8em;'>({q['id']})</span>"
+                f"<div style='margin-top:5px; color:#444;'>{q['ms']}</div>"
+                f"</div>"
+            )
 
-    # 完整的 HTML 结构，包含 CSS 样式
-    full_html = f"""
-    <html>
-    <head>
-        <meta charset='utf-8'>
-        <style>
-            body {{ font-family: "Noto Sans", "Noto Sans SC", sans-serif; line-height: 1.5; color: #333; }}
-            h1 {{ text-align: center; margin-bottom: 30px; }}
-            .paper-header {{ background: #000; color: #fff; padding: 8px 15px; font-weight: bold; margin: 30px 0 15px 0; }}
-            .question-wrapper {{ page-break-inside: avoid; margin-bottom: 40px; border-bottom: 1px solid #eee; padding-bottom: 10px; }}
-            .q-meta {{ font-weight: bold; font-size: 13pt; border-bottom: 2px solid #333; margin-bottom: 10px; position: relative; }}
-            .q-marks {{ color: #2c3e50; margin-left: 15px; font-size: 11pt; }}
-            .q-content {{ margin-bottom: 15px; }}
-            .line {{ border-bottom: 1px solid #999; height: 32px; margin-bottom: 2px; }}
-            
-            .ans-block {{ page-break-inside: avoid; border-bottom: 1px solid #ddd; margin-bottom: 20px; padding-bottom: 10px; }}
-            .ans-num {{ font-weight: bold; color: #c0392b; margin-bottom: 5px; }}
-            .ans-ms {{ font-size: 10pt; background: #fafafa; padding: 8px; border-radius: 3px; }}
-            
-            img {{ max-width: 100%; height: auto; }}
-            table, td, th {{ border: 1px solid #444; border-collapse: collapse; padding: 5px; font-family: sans-serif !important; }}
-        </style>
-    </head>
-    <body>
-        <h1>{title}</h1>
-        {questions_html}
-        {answers_html}
-    </body>
-    </html>
+            main_questions_html += f"""
+            <div class="question-wrapper">
+                <div class="q-meta">
+                    Question {global_count}
+                    <span class="q-marks">{q.get('marks','')}</span>
+                    <span style="float:right; font-weight: normal; font-size: 9pt; color: #777;">Ref: {q['id']}</span>
+                </div>
+                <div class="q-content">{q['body']}</div>
+                <div class="answer-lines">{"<div class='line'></div>" * 4}</div>
+            </div>"""
+
+            main_answers_html += f"""
+            <div class="ans-block">
+                <div class="ans-num">Question {global_count} ({q['id']}) <span style=\"color:#777; font-size:0.9em;\">{q.get('marks','')}</span></div>
+                <div class="ans-ms">{q['ms']}</div>
+            </div>"""
+
+            global_count += 1
+
+    if not has_content:
+        return f"SKIP: {base_out}"
+
+    style = """
+    <style>
+        body { font-family: "Noto Sans", "Noto Sans SC", sans-serif; line-height: 1.5; color: #333; }
+        h1 { text-align: center; margin-bottom: 30px; }
+        .paper-header { background: #000; color: #fff; padding: 8px 15px; font-weight: bold; margin: 30px 0 15px 0; }
+        .question-wrapper { page-break-inside: avoid; margin-bottom: 40px; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .q-meta { font-weight: bold; font-size: 13pt; border-bottom: 2px solid #333; margin-bottom: 10px; }
+        .q-marks { color: #2c3e50; margin-left: 15px; font-size: 11pt; }
+        .q-content { margin-bottom: 15px; }
+        .line { border-bottom: 1px solid #999; height: 32px; margin-bottom: 2px; }
+
+        .ans-block { page-break-inside: avoid; border-bottom: 1px solid #ddd; margin-bottom: 20px; padding-bottom: 10px; }
+        .ans-num { font-weight: bold; color: #c0392b; margin-bottom: 5px; }
+        .ans-ms { font-size: 10pt; background: #fafafa; padding: 8px; border-radius: 3px; }
+
+        img { max-width: 100%; height: auto; }
+        table, td, th { border: 1px solid #444; border-collapse: collapse; padding: 5px; font-family: sans-serif !important; }
+    </style>
     """
-    
-    # 生成 PDF
+
     try:
         config = get_pdfkit_config()
-        pdfkit.from_string(full_html, os.path.join(OUTPUT_DIR, out_name), options=PDF_OPTIONS, configuration=config)
-        return f"SUCCESS: {out_name} (Unique Questions: {global_count-1})"
+
+        full_html = (
+            f"<html><head><meta charset='utf-8'>{style}</head>"
+            f"<body>{main_questions_html}{main_answers_html}</body></html>"
+        )
+        pdfkit.from_string(
+            full_html,
+            os.path.join(OUTPUT_DIR, out_main_name),
+            options=PDF_OPTIONS,
+            configuration=config,
+        )
+
+        sheet_full_html = (
+            f"<html><head><meta charset='utf-8'>{style}</head>"
+            f"<body>{sheet_html}</body></html>"
+        )
+        pdfkit.from_string(
+            sheet_full_html,
+            os.path.join(OUTPUT_DIR, out_sheet_name),
+            options=PDF_OPTIONS,
+            configuration=config,
+        )
+
+        main_out_path = os.path.join(OUTPUT_DIR, out_main_name)
+        sheet_out_path = os.path.join(OUTPUT_DIR, out_sheet_name)
+        if not os.path.exists(main_out_path) or not os.path.exists(sheet_out_path):
+            return (
+                f"FAILED: {base_out} | PDF not written. "
+                f"Check wkhtmltopdf install/path (WKHTMLTOPDF_PATH={WKHTMLTOPDF_PATH}) and output dir ({OUTPUT_DIR})."
+            )
+
+        return f"SUCCESS: {base_out} (Main + Answer Sheet, Unique Questions: {global_count-1})"
     except Exception as e:
-        return f"FAILED: {out_name} | {str(e)}"
+        return f"FAILED: {base_out} | {str(e)}"
 
 def main():
     """
